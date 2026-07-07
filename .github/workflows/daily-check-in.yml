@@ -21,6 +21,10 @@ jobs:
         with:
           python-version: '3.9.19'
 
+      - name: Configure pip mirror
+        run: |
+          pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+
       - name: Install python dependencies
         run: |
           python -m pip install --upgrade pip
