@@ -213,17 +213,18 @@ class LinuxDoBrowser:
     def verify_login_via_api(self) -> tuple[bool, str]:
         """用 curl_cffi + impersonate 走 API 验证 Cookie 是否有效（可穿透 Cloudflare）。
 
-        返回 (是否已登录, 用户名)。主接口 /session/current.json，失败时回退首页 HTML 解析。
+        返回 (是否已登录, 用户名)。主接口 /session/current.json；对 429/403 等状态明确区分，
+        避免把"被限流/被 Cloudflare 拦"误判成"Cookie 失效"，并跳过多余的兜底请求以免加剧限流。
         """
-        # 主接口：/session/current.json → { "current_user": { "username": ... } }
         try:
             resp = self.session.get(
                 CURRENT_USER_URL,
                 impersonate="chrome136",
                 headers={"Accept": "application/json", "Referer": HOME_URL},
             )
-            logger.info(f"/session/current.json 状态码: {resp.status_code}")
-            if resp.status_code == 200:
+            code = resp.status_code
+            logger.info(f"/session/current.json 状态码: {code}")
+            if code == 200:
                 try:
                     data = resp.json()
                 except Exception:
@@ -232,7 +233,21 @@ class LinuxDoBrowser:
                 username = current_user.get("username")
                 if username:
                     return True, username
-                logger.info("/session/current.json 未包含 current_user，尝试兜底校验")
+                logger.info("200 但无 current_user（未登录或 Cookie 未生效），尝试兜底校验")
+            elif code == 429:
+                logger.warning(
+                    "API 返回 429：该出口 IP 被 linux.do 限流（请求太频繁），"
+                    "稍后再试即可，这不代表 Cookie 失效。已跳过兜底请求以免加剧限流"
+                )
+                return False, ""
+            elif code in (401, 403):
+                if self._is_cloudflare_html(resp.text or ""):
+                    logger.warning(
+                        f"API 返回 {code} 且疑似 Cloudflare 拦截：出口 IP 指纹问题，非 Cookie 失效"
+                    )
+                else:
+                    logger.warning(f"API 返回 {code}：可能未登录或 Cookie 失效")
+                return False, ""
         except Exception as e:
             logger.warning(f"API 验证登录异常: {e}")
 
@@ -245,6 +260,9 @@ class LinuxDoBrowser:
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
                 },
             )
+            if resp.status_code == 429:
+                logger.warning("API 兜底：首页也返回 429（被限流），稍后再试")
+                return False, ""
             html = resp.text or ""
             if self._is_cloudflare_html(html):
                 logger.warning("API 兜底：首页被 Cloudflare 拦截，无法据此判断登录状态")
@@ -276,8 +294,26 @@ class LinuxDoBrowser:
         ]
         return any(mk in html for mk in markers)
 
-    def _wait_cloudflare_cleared(self, timeout: int = 20) -> bool:
-        """轮询等待 Cloudflare 清场：标题不再是 "Just a moment" 且出现主内容或用户入口。"""
+    @staticmethod
+    def _is_rate_limited_html(html: str) -> bool:
+        """判断页面是否是 429 限流页（Discourse/Cloudflare 限流）。"""
+        if not html:
+            return False
+        low = html.lower()
+        markers = [
+            "too many requests",
+            "you've performed this action too many times",
+            "rate limit",
+            "请求过于频繁",
+            "访问过于频繁",
+        ]
+        return any(mk in low for mk in markers)
+
+    def _wait_cloudflare_cleared(self, timeout: int = 40) -> bool:
+        """轮询等待 Cloudflare 清场：标题不再是 "Just a moment" 且出现主内容或用户入口。
+
+        被标记的出口 IP 上 Cloudflare 解挑战可能较慢，超时放宽到 40s；命中限流页则提前返回。
+        """
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
@@ -295,6 +331,12 @@ class LinuxDoBrowser:
                 has_app = False
             if not challenging and has_app:
                 return True
+            try:
+                if self._is_rate_limited_html(self.page.html):
+                    logger.warning("检测到限流(429)页面，停止等待 Cloudflare")
+                    return False
+            except Exception:
+                pass
             time.sleep(1)
         return False
 
@@ -311,15 +353,26 @@ class LinuxDoBrowser:
             return False
 
     def _dump_page_state(self) -> None:
-        """失败诊断：打印页面 title/url，并把"被 Cloudflare 拦截"与"Cookie 过期"区分开。"""
+        """失败诊断：打印页面 title/url，区分 Cloudflare 拦截 / 限流(429) / Cookie 问题。"""
         try:
             logger.info(f"当前页面 title={self.page.title!r} url={self.page.url!r}")
         except Exception as e:
             logger.warning(f"读取页面 title/url 失败: {e}")
         try:
-            if self._is_cloudflare_html(self.page.html):
+            html = self.page.html
+            if self._is_cloudflare_html(html):
                 logger.error(
                     "检测到 Cloudflare 人机验证页面：是无头浏览器被拦截，并非 Cookie 过期"
+                )
+            elif self._is_rate_limited_html(html):
+                logger.error(
+                    "检测到限流(429)页面：该出口 IP 请求过于频繁被临时限流，"
+                    "稍后再试或更换出口 IP，并非 Cookie 过期"
+                )
+            else:
+                logger.info(
+                    "页面既非 Cloudflare 也非限流页：若确实未登录，多半是 _t 已失效，"
+                    "请重新从浏览器复制最新 _t"
                 )
         except Exception as e:
             logger.warning(f"读取页面 HTML 失败: {e}")
