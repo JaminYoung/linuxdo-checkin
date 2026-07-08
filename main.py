@@ -4,6 +4,7 @@ new Env("Linux.Do 签到")
 """
 
 import os
+import re
 import random
 import time
 import functools
@@ -61,6 +62,7 @@ HOME_URL = "https://linux.do/"
 LOGIN_URL = "https://linux.do/login"
 SESSION_URL = "https://linux.do/session"
 CSRF_URL = "https://linux.do/session/csrf"
+CURRENT_USER_URL = "https://linux.do/session/current.json"
 
 
 class LinuxDoBrowser:
@@ -88,13 +90,25 @@ class LinuxDoBrowser:
         self.browser = Chromium(co)
         self.page = self.browser.new_tab()
         self.session = requests.Session()
+        # 读取浏览器真实 UA，让 curl_cffi 会话与浏览器 UA 保持一致。
+        # Cloudflare 的 cf_clearance 与 UA 绑定，一致才能在 curl_cffi/浏览器之间复用放行状态。
+        try:
+            browser_ua = self.page.run_js("return navigator.userAgent")
+        except Exception:
+            browser_ua = None
+        self.user_agent = browser_ua or (
+            f"Mozilla/5.0 ({platformIdentifier}) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+        )
         self.session.headers.update(
             {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0",
+                "User-Agent": self.user_agent,
                 "Accept": "application/json, text/javascript, */*; q=0.01",
                 "Accept-Language": "zh-CN,zh;q=0.9",
             }
         )
+        # 登录后记录用户名（Cookie 登录模式下 USERNAME 可能为空）
+        self.username = None
         # 初始化通知管理器
         self.notifier = NotificationManager()
 
@@ -120,40 +134,195 @@ class LinuxDoBrowser:
         return cookies
 
     def login_with_cookies(self, cookie_str: str) -> bool:
-        """使用手动设置的 Cookie 直接登录，跳过账号密码流程"""
+        """使用手动设置的 Cookie 直接登录，跳过账号密码流程。
+
+        两条路径任一成功即视为登录成功：
+        - 浏览器路径：真实（无头）Chromium 能执行 JS，可尝试自行通过 Cloudflare 挑战；
+        - API 路径：curl_cffi + impersonate 直接命中 Discourse 接口（IP 未被 Cloudflare 挑战时可用）。
+        纯 HTTP 客户端无法解 Cloudflare 的 JS 挑战，故被硬拦的 IP 上只能靠浏览器路径。
+        """
         logger.info("检测到手动 Cookie，尝试 Cookie 登录...")
         dp_cookies = self.parse_cookie_string(cookie_str)
         if not dp_cookies:
             logger.error("Cookie 解析失败或为空，无法使用 Cookie 登录")
             return False
 
-        logger.info(f"成功解析 {len(dp_cookies)} 个 Cookie 条目")
+        logger.info(
+            f"成功解析 {len(dp_cookies)} 个 Cookie 条目: {[c['name'] for c in dp_cookies]}"
+        )
 
-        # 同步到 requests.Session，以便后续 API 请求（如 print_connect_info）使用
+        # 同步到 curl_cffi 会话；域用 .linux.do 以便 connect.linux.do 等子域也能带上 Cookie
         for ck in dp_cookies:
-            self.session.cookies.set(ck["name"], ck["value"], domain="linux.do")
+            self.session.cookies.set(ck["name"], ck["value"], domain=".linux.do")
 
-        # 同步到 DrissionPage
-        self.page.set.cookies(dp_cookies)
-        logger.info("Cookie 设置完成，导航至 linux.do...")
-        self.page.get(HOME_URL)
-        time.sleep(5)
-
-        # 验证登录状态
+        # --- 路径 A：浏览器（可执行 JS，尝试自行通过 Cloudflare 挑战）---
+        browser_ok = False
         try:
-            user_ele = self.page.ele("@id=current-user")
+            logger.info("浏览器路径：先匿名访问，让浏览器自行通过 Cloudflare...")
+            self.page.get(HOME_URL)
+            self._wait_cloudflare_cleared()
+            logger.info("注入登录 Cookie 并刷新...")
+            self.page.set.cookies(dp_cookies)
+            self.page.get(HOME_URL)
+            self._wait_cloudflare_cleared()
+            browser_ok = self._browser_logged_in()
         except Exception as e:
-            logger.warning(f"Cookie 登录验证异常: {str(e)}")
+            logger.warning(f"浏览器路径异常: {e}")
+
+        # 把浏览器现场拿到的 Cookie（可能含 cf_clearance）回灌到 curl_cffi，提升 API 命中率
+        self._sync_browser_cookies_to_session()
+
+        # --- 路径 B：curl_cffi API 校验 ---
+        api_ok, username = self.verify_login_via_api()
+
+        if browser_ok or api_ok:
+            self.username = username or self.username
+            who = self.username or "(用户名未知)"
+            logger.success(
+                f"Cookie 登录成功（浏览器={'✓' if browser_ok else '✗'} / "
+                f"API={'✓' if api_ok else '✗'}），已登录为: {who}"
+            )
             return True
-        if not user_ele:
-            if "avatar" in self.page.html:
-                logger.info("Cookie 登录验证成功 (通过 avatar)")
-                return True
-            logger.error("Cookie 登录验证失败 (未找到 current-user)，Cookie 可能已过期")
+
+        logger.error("Cookie 登录失败：浏览器与 API 均未确认登录")
+        self._dump_page_state()
+        return False
+
+    def _sync_browser_cookies_to_session(self) -> None:
+        """把浏览器当前 Cookie（含 Cloudflare 放行 Cookie）同步到 curl_cffi 会话。"""
+        browser_cookies = None
+        try:
+            browser_cookies = self.page.cookies(as_dict=True)
+        except Exception:
+            try:
+                browser_cookies = {
+                    c.get("name"): c.get("value")
+                    for c in (self.page.cookies() or [])
+                    if isinstance(c, dict) and c.get("name")
+                }
+            except Exception as e:
+                logger.warning(f"读取浏览器 Cookie 失败: {e}")
+                return
+        try:
+            for name, value in (browser_cookies or {}).items():
+                if name:
+                    self.session.cookies.set(name, value, domain=".linux.do")
+        except Exception as e:
+            logger.warning(f"同步浏览器 Cookie 到会话失败: {e}")
+
+    def verify_login_via_api(self) -> tuple[bool, str]:
+        """用 curl_cffi + impersonate 走 API 验证 Cookie 是否有效（可穿透 Cloudflare）。
+
+        返回 (是否已登录, 用户名)。主接口 /session/current.json，失败时回退首页 HTML 解析。
+        """
+        # 主接口：/session/current.json → { "current_user": { "username": ... } }
+        try:
+            resp = self.session.get(
+                CURRENT_USER_URL,
+                impersonate="chrome136",
+                headers={"Accept": "application/json", "Referer": HOME_URL},
+            )
+            logger.info(f"/session/current.json 状态码: {resp.status_code}")
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {}
+                current_user = (data or {}).get("current_user") or {}
+                username = current_user.get("username")
+                if username:
+                    return True, username
+                logger.info("/session/current.json 未包含 current_user，尝试兜底校验")
+        except Exception as e:
+            logger.warning(f"API 验证登录异常: {e}")
+
+        # 兜底：取首页 HTML，检测登录痕迹（用户名 / logout 链接 / 内联 current_user）
+        try:
+            resp = self.session.get(
+                HOME_URL,
+                impersonate="chrome136",
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+                },
+            )
+            html = resp.text or ""
+            if self._is_cloudflare_html(html):
+                logger.warning("API 兜底：首页被 Cloudflare 拦截，无法据此判断登录状态")
+                return False, ""
+            m = re.search(
+                r'"current_user"\s*:\s*\{[^{}]*?"username"\s*:\s*"([^"]+)"', html
+            )
+            if m:
+                return True, m.group(1)
+            if "/logout" in html or 'id="current-user"' in html:
+                return True, ""
+        except Exception as e:
+            logger.warning(f"API 兜底验证异常: {e}")
+        return False, ""
+
+    @staticmethod
+    def _is_cloudflare_html(html: str) -> bool:
+        """判断一段 HTML 是否是 Cloudflare 人机验证页。"""
+        if not html:
             return False
-        else:
-            logger.info("Cookie 登录验证成功")
-            return True
+        markers = [
+            "Just a moment",
+            "Checking your browser",
+            "challenge-platform",
+            "cf-chl",
+            "cf_chl",
+            "__cf_",
+            "Enable JavaScript and cookies to continue",
+        ]
+        return any(mk in html for mk in markers)
+
+    def _wait_cloudflare_cleared(self, timeout: int = 20) -> bool:
+        """轮询等待 Cloudflare 清场：标题不再是 "Just a moment" 且出现主内容或用户入口。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                title = self.page.title or ""
+            except Exception:
+                title = ""
+            challenging = ("Just a moment" in title) or ("请稍候" in title)
+            has_app = False
+            try:
+                has_app = bool(
+                    self.page.ele("@id=main-outlet", timeout=0.5)
+                    or self.page.ele("@id=current-user", timeout=0.5)
+                )
+            except Exception:
+                has_app = False
+            if not challenging and has_app:
+                return True
+            time.sleep(1)
+        return False
+
+    def _browser_logged_in(self) -> bool:
+        """浏览器端登录判定：优先 #current-user，回退 avatar 关键字。"""
+        try:
+            if self.page.ele("@id=current-user", timeout=8):
+                return True
+        except Exception:
+            pass
+        try:
+            return "avatar" in self.page.html
+        except Exception:
+            return False
+
+    def _dump_page_state(self) -> None:
+        """失败诊断：打印页面 title/url，并把"被 Cloudflare 拦截"与"Cookie 过期"区分开。"""
+        try:
+            logger.info(f"当前页面 title={self.page.title!r} url={self.page.url!r}")
+        except Exception as e:
+            logger.warning(f"读取页面 title/url 失败: {e}")
+        try:
+            if self._is_cloudflare_html(self.page.html):
+                logger.error(
+                    "检测到 Cloudflare 人机验证页面：是无头浏览器被拦截，并非 Cookie 过期"
+                )
+        except Exception as e:
+            logger.warning(f"读取页面 HTML 失败: {e}")
 
     def login(self):
         logger.info("开始账号密码登录")
@@ -315,14 +484,21 @@ class LinuxDoBrowser:
             if not login_res:  # 登录
                 logger.warning("登录验证失败")
 
+            browse_done = False
             if BROWSE_ENABLED:
-                click_topic_res = self.click_topic()  # 点击主题
-                if not click_topic_res:
-                    logger.error("点击主题失败，程序终止")
-                    return
-                logger.info("完成浏览任务")
+                try:
+                    if self.click_topic():  # 点击主题
+                        logger.info("完成浏览任务")
+                        browse_done = True
+                    else:
+                        logger.warning(
+                            "未找到主题帖或浏览失败（可能被 Cloudflare 拦截），"
+                            "跳过浏览，继续签到流程"
+                        )
+                except Exception as e:
+                    logger.warning(f"浏览任务异常，跳过：{e}")
             self.print_connect_info()  # 打印连接信息
-            self.send_notifications(BROWSE_ENABLED)  # 发送通知
+            self.send_notifications(browse_done)  # 发送通知
         finally:
             try:
                 self.page.close()
@@ -372,10 +548,11 @@ class LinuxDoBrowser:
 
     def send_notifications(self, browse_enabled):
         """发送签到通知"""
-        status_msg = f"✅每日登录成功: {USERNAME}"
+        who = self.username or USERNAME or "LinuxDo 用户"
+        status_msg = f"✅每日登录成功: {who}"
         if browse_enabled:
             status_msg += " + 浏览任务完成"
-        
+
         # 使用通知管理器发送所有通知
         self.notifier.send_all("LINUX DO", status_msg)
 
